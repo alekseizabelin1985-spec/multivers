@@ -1,4 +1,3 @@
-// services/narrativeorchestrator/oracle.go
 package narrativeorchestrator
 
 import (
@@ -12,14 +11,15 @@ import (
 // OracleResponse represents the JSON output from Qwen3.
 type OracleResponse struct {
 	Narrative string                   `json:"narrative"`
+	Mood      []string                 `json:"mood,omitempty"` // Атмосфера от LLM
 	NewEvents []map[string]interface{} `json:"new_events"`
 }
 
 // CallOracle sends a prompt to Ascension Oracle and returns the response.
-func CallOracle(ctx context.Context, prompt string) (*OracleResponse, error) {
+func CallOracle(ctx context.Context, systemPrompt, userPrompt string) (*OracleResponse, error) {
 	client := oracle.NewClient()
 
-	content, err := client.CallAndLog(ctx, prompt)
+	content, err := client.CallStructured(ctx, systemPrompt, userPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to oracle: %w", err)
 	}
@@ -39,9 +39,9 @@ func CallOracle(ctx context.Context, prompt string) (*OracleResponse, error) {
 	return &result, nil
 }
 
-// BuildPrompt constructs the Qwen3-compatible prompt.
-func BuildPrompt(worldContext, scopeID, scopeType string, entitiesContext, triggerEvent string) string {
-	return strings.TrimSpace(`
+// BuildPrompts returns system and user parts separately.
+func BuildPrompts(worldContext, scopeID, scopeType string, entitiesContext, triggerEvent string) (systemPrompt, userPrompt string) {
+	systemPrompt = strings.TrimSpace(`
 Ты — Повествователь Мира. Твоя задача — развивать историю естественно, иммерсивно и поэтично.
 
 ### КОНТЕКСТ МИРА
@@ -51,28 +51,32 @@ func BuildPrompt(worldContext, scopeID, scopeType string, entitiesContext, trigg
 ID области: ` + scopeID + `
 Тип области: ` + scopeType + `
 Сущности в области:
-` + entitiesContext + `
+` + entitiesContext)
 
+	userPrompt = strings.TrimSpace(`
 ### СОБЫТИЕ-ТРИГГЕР
 ` + triggerEvent + `
 
 ### ЗАДАЧА
-Придумай, что происходит дальше.
+Подумай: что *логично* происходит дальше?
+— Учитывай факты, характеры, обстановку.
+— Если уместно, используй стилевые модификаторы: 
+  «внезапно», «трагично», «иронично», «поэтично», «мрачно» и т.д.
+— Ты волен определить тон и атмосферу самостоятельно.
 
 ### ТРЕБОВАНИЯ
 1. Ответ строго в формате JSON.
-2. Поле "narrative" — описание для игроков (1–3 предложения).
-3. Поле "new_events" — массив логичных следствий (макс. 3 события).
-4. Не упоминай игроков напрямую.
-5. Не предлагай выборы — только факты и атмосферу.
-6. Возможны какие-то действия, например, пройти проверку.
+2. "narrative": 1–3 предложения, для игроков.
+3. "mood": массив строк (опционально).
+4. "new_events": массив (макс. 3) событий.
 
 ### ФОРМАТ ОТВЕТА
 {
   "narrative": "строка",
+  "mood": ["тег1", "тег2"],
   "new_events": [
-    { "event_type": "...", "source": "...", "target": "...", "payload": { ... } }
+    { "event_type": "строка", "source": "ID", "target": "ID?", "payload": { ... } }
   ]
-} /no_think
-`)
+}`)
+	return systemPrompt, userPrompt
 }

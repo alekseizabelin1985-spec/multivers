@@ -1,4 +1,3 @@
-// services/narrativeorchestrator/orchestrator.go
 package narrativeorchestrator
 
 import (
@@ -22,6 +21,13 @@ type SemanticMemoryClient struct {
 
 type GetContextResponse struct {
 	Contexts map[string]string `json:"contexts"`
+}
+
+// StateSnapshot — структура для KnowledgeBase (заглушка под MinIO).
+type StateSnapshot struct {
+	Entities map[string]interface{} `json:"entities"`
+	Canon    []string               `json:"canon"`
+	LastMood []string               `json:"last_mood,omitempty"`
 }
 
 func (c *SemanticMemoryClient) GetContext(ctx context.Context, entityIDs []string) (map[string]string, error) {
@@ -89,10 +95,16 @@ func (no *NarrativeOrchestrator) CreateGM(ev eventbus.Event) {
 		ScopeType: scopeType,
 		WorldID:   ev.WorldID,
 		State:     make(map[string]interface{}),
-		History:   []string{},
+		History:   []HistoryEntry{}, // ← обновлено
 		Config:    config,
 		CreatedAt: time.Now(),
 	}
+
+	// TODO: Попытка восстановить из снапшота
+	// if savedGM, err := no.loadSnapshot(scopeID); err == nil {
+	// 	gm = savedGM
+	// 	log.Printf("GM rehydrated from snapshot for %s", scopeID)
+	// }
 
 	// Set timeout
 	if timeoutMin, ok := config["timeout_minutes"].(float64); ok && timeoutMin > 0 {
@@ -166,7 +178,10 @@ func (no *NarrativeOrchestrator) HandleGameEvent(ev eventbus.Event) {
 	// Обновляем историю (требует записи)
 	no.mu.Lock()
 	if currentGM, exists := no.gms[scopeID]; exists {
-		currentGM.History = append(currentGM.History, ev.EventID)
+		currentGM.History = append(currentGM.History, HistoryEntry{
+			EventID:   ev.EventID,
+			Timestamp: ev.Timestamp,
+		})
 	}
 	no.mu.Unlock()
 
@@ -204,13 +219,27 @@ func (no *NarrativeOrchestrator) HandleGameEvent(ev eventbus.Event) {
 		triggerEvent = "Событие с участием: " + strings.Join(toStringSlice(mentions), ", ")
 	}
 
-	// Генерация повествования
-	prompt := BuildPrompt(worldContext, scopeID, gmCopy.ScopeType, entitiesContext, triggerEvent)
+	// Генерация повествования с разделением system/user
+	systemPrompt, userPrompt := BuildPrompts(worldContext, scopeID, gmCopy.ScopeType, entitiesContext, triggerEvent)
 
-	oracleResp, err := CallOracle(context.Background(), prompt)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	oracleResp, err := CallOracle(ctx, systemPrompt, userPrompt)
 	if err != nil {
 		log.Printf("[event=%s] Oracle call failed for GM %s: %v", ev.EventID, scopeID, err)
 		return
+	}
+
+	// Сохраняем mood для continuity
+	if len(oracleResp.Mood) > 0 {
+		no.mu.Lock()
+		if gm, exists := no.gms[scopeID]; exists {
+			if gm.State == nil {
+				gm.State = make(map[string]interface{})
+			}
+			gm.State["last_mood"] = oracleResp.Mood
+		}
+		no.mu.Unlock()
 	}
 
 	// Публикация результата
@@ -222,6 +251,7 @@ func (no *NarrativeOrchestrator) HandleGameEvent(ev eventbus.Event) {
 		ScopeID:   &scopeID,
 		Payload: map[string]interface{}{
 			"narrative":  oracleResp.Narrative,
+			"mood":       oracleResp.Mood,
 			"new_events": oracleResp.NewEvents,
 			"trigger":    ev.EventID,
 			"gm_scope":   scopeID,
