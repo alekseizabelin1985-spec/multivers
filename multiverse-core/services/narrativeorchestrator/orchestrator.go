@@ -3,7 +3,9 @@ package narrativeorchestrator
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"multiverse-core/internal/eventbus"
+	"multiverse-core/internal/minio"
 )
 
 // SemanticMemoryClient fetches context from Semantic Memory Builder.
@@ -56,10 +59,11 @@ func (c *SemanticMemoryClient) GetContext(ctx context.Context, entityIDs []strin
 
 // NarrativeOrchestrator manages GM instances.
 type NarrativeOrchestrator struct {
-	gms      map[string]*GMInstance
-	mu       sync.RWMutex
-	bus      *eventbus.EventBus
-	semantic *SemanticMemoryClient
+	gms         map[string]*GMInstance
+	mu          sync.RWMutex
+	bus         *eventbus.EventBus
+	semantic    *SemanticMemoryClient
+	minioClient *minio.Client // ← новое поле
 }
 
 // NewNarrativeOrchestrator creates a new orchestrator.
@@ -69,10 +73,22 @@ func NewNarrativeOrchestrator(bus *eventbus.EventBus) *NarrativeOrchestrator {
 		semanticURL = "http://semantic-memory:8080"
 	}
 
+	minioCfg := minio.Config{
+		Endpoint:        os.Getenv("MINIO_ENDPOINT"),
+		AccessKeyID:     os.Getenv("MINIO_ACCESS_KEY"),
+		SecretAccessKey: os.Getenv("MINIO_SECRET_KEY"),
+		Region:          "us-east-1",
+	}
+	minioClient, err := minio.NewClient(minioCfg)
+	if err != nil {
+		log.Fatalf("Failed to create MinIO client: %v", err)
+	}
+
 	return &NarrativeOrchestrator{
-		gms:      make(map[string]*GMInstance),
-		bus:      bus,
-		semantic: &SemanticMemoryClient{BaseURL: semanticURL},
+		gms:         make(map[string]*GMInstance),
+		bus:         bus,
+		semantic:    &SemanticMemoryClient{BaseURL: semanticURL},
+		minioClient: minioClient,
 	}
 }
 
@@ -98,6 +114,14 @@ func (no *NarrativeOrchestrator) CreateGM(ev eventbus.Event) {
 		History:   []HistoryEntry{}, // ← обновлено
 		Config:    config,
 		CreatedAt: time.Now(),
+	}
+
+	// Попытка восстановить из снапшота
+	if savedGM, err := no.loadSnapshot(scopeID); err == nil {
+		gm = savedGM
+		log.Printf("GM rehydrated from snapshot for %s", scopeID)
+	} else {
+		log.Printf("No snapshot for %s, creating new GM", scopeID)
 	}
 
 	// TODO: Попытка восстановить из снапшота
@@ -177,7 +201,8 @@ func (no *NarrativeOrchestrator) HandleGameEvent(ev eventbus.Event) {
 
 	// Обновляем историю (требует записи)
 	no.mu.Lock()
-	if currentGM, exists := no.gms[scopeID]; exists {
+	currentGM, exists := no.gms[scopeID]
+	if exists {
 		currentGM.History = append(currentGM.History, HistoryEntry{
 			EventID:   ev.EventID,
 			Timestamp: ev.Timestamp,
@@ -228,6 +253,10 @@ func (no *NarrativeOrchestrator) HandleGameEvent(ev eventbus.Event) {
 	if err != nil {
 		log.Printf("[event=%s] Oracle call failed for GM %s: %v", ev.EventID, scopeID, err)
 		return
+	}
+	// После успешного вызова Oracle
+	if err := no.saveSnapshot(scopeID, currentGM); err != nil {
+		log.Printf("Snapshot save failed for %s: %v", scopeID, err)
 	}
 
 	// Сохраняем mood для continuity
@@ -296,4 +325,78 @@ func toStringSlice(v []interface{}) []string {
 		}
 	}
 	return res
+}
+
+// saveSnapshot сохраняет состояние GM в MinIO.
+func (no *NarrativeOrchestrator) saveSnapshot(scopeID string, gm *GMInstance) error {
+	// Формируем snapshot как KnowledgeBase
+	snapshot := StateSnapshot{
+		Entities: map[string]interface{}{
+			scopeID: map[string]interface{}{
+				"scope_type":  gm.ScopeType,
+				"world_id":    gm.WorldID,
+				"history_len": len(gm.History),
+			},
+		},
+		Canon: []string{
+			// TODO: Загрузить из Semantic Memory или события
+		},
+	}
+	if lastMood, ok := gm.State["last_mood"]; ok {
+		if mood, ok := lastMood.([]string); ok {
+			snapshot.LastMood = mood
+		}
+	}
+
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("marshal snapshot: %w", err)
+	}
+
+	// Путь: gnue/gm-snapshots/v1/{sha256(scope_id)}/{timestamp}_001.json
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(scopeID)))
+	timestamp := time.Now().Unix()
+	path := fmt.Sprintf("gnue/gm-snapshots/v1/%s/%d_001.json", hash, timestamp)
+
+	return no.minioClient.PutObject("gnue-snapshots", path, bytes.NewReader(data), int64(len(data)))
+}
+
+// loadSnapshot загружает последний снапшот для scopeID.
+func (no *NarrativeOrchestrator) loadSnapshot(scopeID string) (*GMInstance, error) {
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(scopeID)))
+	prefix := fmt.Sprintf("gnue/gm-snapshots/v1/%s/", hash)
+
+	objects, err := no.minioClient.ListObjects("gnue-snapshots", prefix)
+	if err != nil {
+		return nil, err
+	}
+	if len(objects) == 0 {
+		return nil, fmt.Errorf("no snapshots found")
+	}
+
+	// Берём самый свежий
+	latest := objects[0]
+	data, err := no.minioClient.GetObject("gnue-snapshots", latest.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	var snapshot StateSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil, err
+	}
+
+	// Восстанавливаем GM (минимально)
+	gm := &GMInstance{
+		ScopeID: scopeID,
+		// ScopeType, WorldID — можно извлечь из snapshot.Entities или оставить пустыми
+		State: map[string]interface{}{
+			"last_mood": snapshot.LastMood,
+		},
+		History:   []HistoryEntry{}, // Историю можно загрузить из event log отдельно
+		Config:    map[string]interface{}{},
+		CreatedAt: time.Now().Add(-1 * time.Minute), // Чтобы таймаут не сработал сразу
+	}
+
+	return gm, nil
 }
