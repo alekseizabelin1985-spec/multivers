@@ -1,0 +1,21 @@
+# Project Debug Rules (Non-Obvious Only)
+
+- Webview dev tools accessed via Command Palette > "Developer: Open Webview Developer Tools" (not F12)
+- IPC messages fail silently if not wrapped in try/catch in packages/ipc/src/ - this is a common gotcha
+- Production builds require NODE_ENV=production or certain features break without error - this is a critical requirement
+- Database migrations must run from packages/evals/ directory, not root - this is required for proper migration
+- Extension logs only visible in "Extension Host" output channel, not Debug Console - this is where to look for logs
+- Event bus connections require proper broker configuration - check KAFKA_BROKERS environment variable
+- MinIO connections require proper credentials and endpoint configuration - these are critical for entity storage
+- Semantic Memory Builder requires proper ChromaDB and Neo4j setup - these are required for RAG functionality
+- World generation requires proper Oracle URL configuration - this is critical for generation
+- All services must be run with Docker Compose for proper environment setup - this is required for debugging
+- Services communicate through event bus, not direct API calls - this is how debugging should be done
+- Entity manager supports both state changes and full entity snapshots - both approaches are valid for debugging
+- All services must be able to recover from snapshots and replay events - this is required for proper debugging
+- Services must handle entity travel between worlds through snapshot management - this is required for world transitions
+- All services must be able to handle concurrent access to shared resources - this is important for debugging
+- Services use specific event types for different operations (entity.created, entity.updated, world.generated, etc.) - these are the only valid event types
+- World generation requires specific seed-based prompts for Qwen3 - these prompts are critical for proper generation
+- All services must be built with CGO_ENABLED=0 for cross-platform compatibility - this is required for all builds
+- Services use specific environment variables for configuration (MINIO_ENDPOINT, ORACLE_URL, SEMANTIC_MEMORY_URL, etc.) - these are the only valid environment variables

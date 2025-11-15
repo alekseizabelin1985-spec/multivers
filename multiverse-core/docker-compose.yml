@@ -1,0 +1,277 @@
+version: '3.8'
+
+services:
+  # ========== Событийная шина ==========
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
+    ports:
+      - "9092:9092"   # Kafka API
+      - "8081:8081"   # Schema Registry
+      - "9644:9644"   # Admin API
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092 # ← говорить клиентам: "подключайтесь сюда"
+
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
+    depends_on:
+      - redpanda
+    command: >
+      sh -c "
+        sleep 10 &&
+        rpk topic create
+          player_events
+          world_events
+          game_events
+          system_events
+          --brokers redpanda:9092
+      "
+
+  # ========== Хранение снапшотов ==========
+  minio:
+    image: minio/minio
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+  # ========== Векторная БД (Semantic Memory) ==========
+  chromadb:
+    image: chromadb/chroma:0.4.24
+    ports:
+      - "8000:8000"
+    environment:
+      IS_PERSISTENT: "true"
+      ANONYMIZED_TELEMETRY: "false"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  # ========== Граф знаний ==========
+  neo4j:
+    image: neo4j:5.18
+    ports:
+      - "7474:7474"   # HTTP
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
+
+  # ========== Метрики (TimescaleDB) ==========
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: metrics
+      POSTGRES_USER: metrics
+      POSTGRES_PASSWORD: metrics
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+
+  # ========== Сборка и запуск вашего сервиса ==========
+  entity-manager:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=entity-manager    
+    command: ./entity-manager
+    depends_on:
+      - redpanda
+      - minio
+    #environment:
+    #  - KAFKA_BROKERS=redpanda:9092
+    #  - MINIO_ENDPOINT=minio:9000
+    #  - MINIO_ACCESS_KEY=minioadmin
+    #  - MINIO_SECRET_KEY=minioadmin
+    env_file:
+      - .env
+    # Раскомментируйте для отладки:
+    # stdin_open: true
+    # tty: true
+  narrative-orchestrator:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=narrative-orchestrator
+    command: ./narrative-orchestrator
+    depends_on:
+      - redpanda
+      - semantic-memory
+      #- qwen3-service
+    env_file:
+      - .env  
+    #environment:
+    #  - KAFKA_BROKERS=redpanda:9092
+    #  - SEMANTIC_MEMORY_URL=http://semantic-memory:8080
+    #  - ORACLE_URL=http://qwen3-service:11434/v1/chat/completions
+      #- ORACLE_URL=http://192.168.3.12:1234/v1/chat/completions
+  semantic-memory:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=semantic-memory
+    command: ./semantic-memory
+    depends_on:
+      - redpanda
+      - minio
+      - chromadb
+    ports:
+      - "8082:8082"
+    env_file:
+      - .env  
+    #environment:
+    #  - KAFKA_BROKERS=redpanda:9092
+    #  - CHROMA_URL=http://chromadb:8000
+    #  - NEO4J_URI=neo4j://neo4j:7687
+    #  - NEO4J_USER=neo4j
+    #  - NEO4J_PASSWORD=password
+    #  - PORT=8080
+  ontological-archivist:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=ontological-archivist
+    command: ./ontological-archivist
+    depends_on:
+      - redpanda
+      - chromadb
+      - neo4j
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env  
+    #environment:
+    #  - KAFKA_BROKERS=redpanda:9092
+    #  - CHROMA_URL=http://chromadb:8000
+    #  - NEO4J_URI=neo4j://neo4j:7687
+    #  - NEO4J_USER=neo4j
+    #  - NEO4J_PASSWORD=password
+    #  - PORT=8080
+  plan-manager:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=plan-manager
+    command: ./plan-manager
+    depends_on:
+      - redpanda
+    env_file:
+      - .env  
+  world-generator:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=world-generator
+    command: ./world-generator
+    depends_on:
+      - redpanda
+      - ontological-archivist
+    env_file:
+      - .env 
+  universe-genesis-oracle:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=universe-genesis-oracle
+    command: ./universe-genesis-oracle
+    depends_on:
+      - redpanda
+      - ontological-archivist
+    env_file:
+      - .env       
+  cultivation-module:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=cultivation-module
+    command: ./cultivation-module
+    depends_on:
+      - redpanda
+      - ontological-archivist
+    env_file:
+      - .env  
+  # ========== ИИ: Qwen3 через Ollama ==========
+  qwen3-pull:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    command: [ "pull", "qwen3"]
+    profiles: ["init"]  # ← запускается только при необходимости
+  qwen3-service:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    #depends_on:
+    #  - qwen3-pull
+    # Загружаем модель при старте
+    
+    # Для GPU (опционально):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+      
+  # ========== Game Service ==========
+  game-service:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+      args:
+        - SERVICE=gameservice
+    command: ./gameservice
+    depends_on:
+      - redpanda
+      - entity-manager
+    ports:
+      - "8088:8088"
+    env_file:
+      - .env
+    environment:
+      - HTTP_ADDR=:8088
+      - CACHE_TTL=5m
+      
+  # ========== Утилита для работы с Kafka ==========
+  kafkacat:
+    image: confluentinc/cp-kafkacat:latest
+    depends_on:
+      - redpanda
+    entrypoint: /bin/sh
+    command: -c "echo 'Waiting for Redpanda to be ready...' && while ! nc -z redpanda 9092; do sleep 1; done && echo 'Redpanda is ready!' && tail -f /dev/null"
+    
+
+volumes:
+  minio_data:
+  chroma_data:
+  neo4j_data:
+  timescale_data:
+  ollama_data:  # ← для кэша моделей Ollama
+
+  

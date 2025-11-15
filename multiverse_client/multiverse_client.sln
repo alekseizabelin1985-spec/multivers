@@ -1,0 +1,34 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 15
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Assembly-CSharp", "Assembly-CSharp.csproj", "{4BD23DCB-BCCA-EAF6-255A-5573864B4579}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Assets", "Assets", "{D62BC301-0301-4E9D-A7DD-3E9A720CDF28}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Scripts", "Scripts", "{145EE9A2-E6AD-4B2F-9140-FCDB33888C26}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Network", "Network", "{08B6023E-B314-4CEE-ABE0-62796B9717B8}"
+	ProjectSection(SolutionItems) = preProject
+		Event.cs = Event.cs
+		EventGateway.cs = EventGateway.cs
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{4BD23DCB-BCCA-EAF6-255A-5573864B4579}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4BD23DCB-BCCA-EAF6-255A-5573864B4579}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4BD23DCB-BCCA-EAF6-255A-5573864B4579}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4BD23DCB-BCCA-EAF6-255A-5573864B4579}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{145EE9A2-E6AD-4B2F-9140-FCDB33888C26} = {D62BC301-0301-4E9D-A7DD-3E9A720CDF28}
+		{08B6023E-B314-4CEE-ABE0-62796B9717B8} = {145EE9A2-E6AD-4B2F-9140-FCDB33888C26}
+	EndGlobalSection
+EndGlobal

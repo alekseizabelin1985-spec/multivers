@@ -1,0 +1,47 @@
+// Package main is the entry point for SemanticMemory.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"multiverse-core/internal/eventbus"
+	"multiverse-core/services/semanticmemory"
+)
+
+func main() {
+	// Initialize event bus
+	brokers := strings.Split(os.Getenv("KAFKA_BROKERS"), ",")
+	if len(brokers) == 0 || brokers[0] == "" {
+		brokers = []string{"redpanda:9092"}
+	}
+	bus := eventbus.NewEventBus(brokers)
+
+	// Create and run service
+	service, err := semanticmemory.NewService(bus)
+	if err != nil {
+		log.Fatal("Failed to initialize SemanticMemory:", err)
+	}
+
+	// Handle shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Shutting down SemanticMemory...")
+		cancel()
+	}()
+
+	log.Println("SemanticMemory starting...")
+	if err := service.Run(ctx); err != nil && err != context.Canceled {
+		log.Fatal("Service failed:", err)
+	}
+	log.Println("SemanticMemory stopped.")
+}
