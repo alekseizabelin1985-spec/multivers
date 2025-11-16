@@ -1,0 +1,19 @@
+# GM для мира (world:*)
+scope_type: "world"
+focus_entities: []
+time_window: "24h"
+context_depth:
+  canon: 5
+  history: 10
+  entities: 0
+include:
+  world_facts: true
+  entity_emotions: false
+  location_details: true
+  temporal_context: true
+triggers:
+  time_interval_ms: 30000  # реже — глобальные события
+  max_events: 100
+  narrative_triggers:
+    - "world.cataclysm_started"
+    - "season.changed"

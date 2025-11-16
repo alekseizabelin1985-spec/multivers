@@ -1,0 +1,19 @@
+# GM для игрока (player:*)
+scope_type: "player"
+focus_entities: ["{{.player_id}}"]
+time_window: "2m"
+context_depth:
+  canon: 1
+  history: 2
+  entities: 1
+include:
+  world_facts: false
+  entity_emotions: true
+  location_details: true
+  temporal_context: true
+triggers:
+  time_interval_ms: 5000  # чаще — персональные реакции
+  narrative_triggers:
+    - "player.used_skill"
+    - "player.died"
+    - "player.got_item"

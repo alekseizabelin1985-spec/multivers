@@ -1,3 +1,5 @@
+// services/narrativeorchestrator/orchestrator.go
+
 package narrativeorchestrator
 
 import (
@@ -9,15 +11,17 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
 
+	"multiverse-core/internal/config"
 	"multiverse-core/internal/eventbus"
 	"multiverse-core/internal/minio"
+	"multiverse-core/internal/spatial"
 )
 
-// SemanticMemoryClient fetches context from Semantic Memory Builder.
 type SemanticMemoryClient struct {
 	BaseURL string
 }
@@ -26,7 +30,6 @@ type GetContextResponse struct {
 	Contexts map[string]string `json:"contexts"`
 }
 
-// StateSnapshot — структура для KnowledgeBase (заглушка под MinIO).
 type StateSnapshot struct {
 	Entities map[string]interface{} `json:"entities"`
 	Canon    []string               `json:"canon"`
@@ -37,36 +40,32 @@ func (c *SemanticMemoryClient) GetContext(ctx context.Context, entityIDs []strin
 	if len(entityIDs) == 0 {
 		return map[string]string{}, nil
 	}
-
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"entity_ids": entityIDs,
 		"depth":      2,
 	})
-
 	resp, err := http.Post(c.BaseURL+"/v1/context", "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	var result GetContextResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-
 	return result.Contexts, nil
 }
 
-// NarrativeOrchestrator manages GM instances.
 type NarrativeOrchestrator struct {
 	gms         map[string]*GMInstance
 	mu          sync.RWMutex
 	bus         *eventbus.EventBus
 	semantic    *SemanticMemoryClient
-	minioClient *minio.Client // ← новое поле
+	minioClient *minio.Client
+	configStore *config.Store
+	geoProvider spatial.GeometryProvider
 }
 
-// NewNarrativeOrchestrator creates a new orchestrator.
 func NewNarrativeOrchestrator(bus *eventbus.EventBus) *NarrativeOrchestrator {
 	semanticURL := os.Getenv("SEMANTIC_MEMORY_URL")
 	if semanticURL == "" {
@@ -79,31 +78,71 @@ func NewNarrativeOrchestrator(bus *eventbus.EventBus) *NarrativeOrchestrator {
 		SecretAccessKey: os.Getenv("MINIO_SECRET_KEY"),
 		Region:          "us-east-1",
 	}
-	minioClient, err := minio.NewClient(minioCfg)
-	if err != nil {
-		log.Fatalf("Failed to create MinIO client: %v", err)
-	}
+	minioClient, _ := minio.NewClient(minioCfg)
+	geoProvider := spatial.NewSemanticMemoryProvider(semanticURL)
+	configStore := config.NewStore(minioClient, "gnue-configs")
 
 	return &NarrativeOrchestrator{
 		gms:         make(map[string]*GMInstance),
 		bus:         bus,
 		semantic:    &SemanticMemoryClient{BaseURL: semanticURL},
 		minioClient: minioClient,
+		configStore: configStore,
+		geoProvider: geoProvider,
 	}
 }
 
-// CreateGM handles gm.created event.
+func extractIDFromScope(scopeID string) string {
+	if parts := strings.SplitN(scopeID, ":", 2); len(parts) == 2 {
+		return parts[1]
+	}
+	return scopeID
+}
+
+func getDefaultProfile() *config.Profile {
+	return &config.Profile{
+		TimeWindow: "10m",
+		Triggers: struct {
+			TimeIntervalMs    int      `yaml:"time_interval_ms,omitempty" json:"time_interval_ms,omitempty"`
+			MaxEvents         int      `yaml:"max_events,omitempty" json:"max_events,omitempty"`
+			NarrativeTriggers []string `yaml:"narrative_triggers,omitempty" json:"narrative_triggers,omitempty"`
+		}{
+			TimeIntervalMs: 10000,
+			MaxEvents:      50,
+		},
+	}
+}
+
 func (no *NarrativeOrchestrator) CreateGM(ev eventbus.Event) {
-	scopeID, ok := ev.Payload["scope_id"].(string)
-	if !ok {
-		log.Printf("[event=%s] Invalid gm.created: missing scope_id", ev.EventID)
-		return
+	scopeID, _ := ev.Payload["scope_id"].(string)
+	scopeType, _ := ev.Payload["scope_type"].(string)
+	if scopeType == "" {
+		if parts := strings.SplitN(scopeID, ":", 2); len(parts) == 2 {
+			scopeType = parts[0]
+		} else {
+			scopeType = "unknown"
+		}
 	}
 
-	scopeType, _ := ev.Payload["scope_type"].(string)
-	config, _ := ev.Payload["config"].(map[string]interface{})
-	if config == nil {
-		config = map[string]interface{}{"timeout_minutes": 30.0}
+	profile, _ := no.configStore.GetProfile(scopeType)
+	if profile == nil {
+		profile = getDefaultProfile()
+	}
+
+	override, _ := no.configStore.GetOverride(scopeID)
+	if override != nil {
+		profile = config.MergeProfiles(profile, override)
+	}
+
+	focusEntities := make([]string, len(profile.FocusEntities))
+	for i, tpl := range profile.FocusEntities {
+		if strings.Contains(tpl, "{{.player_id}}") {
+			focusEntities[i] = strings.Replace(tpl, "{{.player_id}}", extractIDFromScope(scopeID), -1)
+		} else if strings.Contains(tpl, "{{.group_id}}") {
+			focusEntities[i] = strings.Replace(tpl, "{{.group_id}}", extractIDFromScope(scopeID), -1)
+		} else {
+			focusEntities[i] = tpl
+		}
 	}
 
 	gm := &GMInstance{
@@ -111,116 +150,137 @@ func (no *NarrativeOrchestrator) CreateGM(ev eventbus.Event) {
 		ScopeType: scopeType,
 		WorldID:   ev.WorldID,
 		State:     make(map[string]interface{}),
-		History:   []HistoryEntry{}, // ← обновлено
-		Config:    config,
+		History:   []HistoryEntry{},
+		Config:    profile.ToMap(),
 		CreatedAt: time.Now(),
 	}
 
-	// Попытка восстановить из снапшота
-	if savedGM, err := no.loadSnapshot(scopeID); err == nil {
+	geometry, _ := no.geoProvider.GetGeometry(context.Background(), ev.WorldID, scopeID)
+	if geometry == nil {
+		geometry = &spatial.Geometry{Point: &spatial.Point{X: 0, Y: 0}}
+	}
+
+	gm.VisibilityScope = spatial.DefaultScope(scopeType, geometry, gm.Config)
+	if scopeType == "location" {
+		gm.VisibilityScope = gm.VisibilityScope.Buffer(200)
+	}
+
+	if savedGM, _ := no.loadSnapshot(scopeID); savedGM != nil {
 		gm = savedGM
-		log.Printf("GM rehydrated from snapshot for %s", scopeID)
-	} else {
-		log.Printf("No snapshot for %s, creating new GM", scopeID)
+		gm.ScopeID = scopeID
+		gm.ScopeType = scopeType
+		gm.WorldID = ev.WorldID
+		gm.Config = profile.ToMap()
+		geometry, _ = no.geoProvider.GetGeometry(context.Background(), ev.WorldID, scopeID)
+		if geometry != nil {
+			gm.VisibilityScope = spatial.DefaultScope(scopeType, geometry, gm.Config)
+			if scopeType == "location" {
+				gm.VisibilityScope = gm.VisibilityScope.Buffer(200)
+			}
+		}
 	}
 
-	// TODO: Попытка восстановить из снапшота
-	// if savedGM, err := no.loadSnapshot(scopeID); err == nil {
-	// 	gm = savedGM
-	// 	log.Printf("GM rehydrated from snapshot for %s", scopeID)
-	// }
-
-	// Set timeout
-	if timeoutMin, ok := config["timeout_minutes"].(float64); ok && timeoutMin > 0 {
-		time.AfterFunc(time.Duration(timeoutMin)*time.Minute, func() {
-			no.DeleteGMByScope(scopeID)
-		})
+	timeoutMin := 30.0
+	if cfgTriggers, ok := gm.Config["triggers"].(map[string]interface{}); ok {
+		if intervalMs, ok := cfgTriggers["time_interval_ms"].(float64); ok {
+			timeoutMin = intervalMs / 60000.0 * 5
+		}
 	}
+	time.AfterFunc(time.Duration(timeoutMin)*time.Minute, func() {
+		no.DeleteGMByScope(scopeID)
+	})
 
 	no.mu.Lock()
 	no.gms[scopeID] = gm
 	no.mu.Unlock()
 
-	log.Printf("[event=%s] GM created for scope %s (type: %s)", ev.EventID, scopeID, scopeType)
+	log.Printf("GM created: %s (type: %s)", scopeID, scopeType)
 }
 
-// DeleteGMByScope safely deletes a GM by scope_id.
+func (no *NarrativeOrchestrator) extractEventPoint(ev eventbus.Event) (spatial.Point, bool) {
+	if loc, ok := ev.Payload["location"].(map[string]interface{}); ok {
+		x := loc["x"].(float64)
+		y := loc["y"].(float64)
+		return spatial.Point{X: x, Y: y}, true
+	}
+	if to, ok := ev.Payload["to"].(map[string]interface{}); ok {
+		x := to["x"].(float64)
+		y := to["y"].(float64)
+		return spatial.Point{X: x, Y: y}, true
+	}
+	return spatial.Point{}, false
+}
+
 func (no *NarrativeOrchestrator) DeleteGMByScope(scopeID string) {
 	no.mu.Lock()
 	defer no.mu.Unlock()
-	if _, exists := no.gms[scopeID]; exists {
-		delete(no.gms, scopeID)
-		log.Printf("GM auto-deleted for inactive scope %s", scopeID)
-	}
+	delete(no.gms, scopeID)
 }
 
-// DeleteGM handles gm.deleted event.
 func (no *NarrativeOrchestrator) DeleteGM(ev eventbus.Event) {
-	scopeID, ok := ev.Payload["scope_id"].(string)
-	if !ok {
-		log.Printf("[event=%s] Invalid gm.deleted: missing scope_id", ev.EventID)
-		return
-	}
-
+	scopeID, _ := ev.Payload["scope_id"].(string)
 	no.mu.Lock()
 	delete(no.gms, scopeID)
 	no.mu.Unlock()
-
-	log.Printf("[event=%s] GM deleted for scope %s", ev.EventID, scopeID)
+	log.Printf("GM deleted: %s", scopeID)
 }
 
-// MergeGM handles gm.merged event (stub).
-func (no *NarrativeOrchestrator) MergeGM(ev eventbus.Event) {
-	log.Printf("[event=%s] gm.merged received (stub): %v", ev.EventID, ev.Payload)
-	// TODO: Implement merging logic
+func (no *NarrativeOrchestrator) MergeGM(ev eventbus.Event) {}
+func (no *NarrativeOrchestrator) SplitGM(ev eventbus.Event) {}
+
+func (no *NarrativeOrchestrator) loadSnapshot(scopeID string) (*GMInstance, error) {
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(scopeID)))
+	prefix := path.Join("gnue", "gm-snapshots", "v1", hash)
+	objects, _ := no.minioClient.ListObjects("gnue-snapshots", prefix)
+	if len(objects) == 0 {
+		return nil, fmt.Errorf("no snapshots")
+	}
+	data, _ := no.minioClient.GetObject("gnue-snapshots", objects[0].Key)
+	var gm GMInstance
+	json.Unmarshal(data, &gm)
+	return &gm, nil
 }
 
-// SplitGM handles gm.split event (stub).
-func (no *NarrativeOrchestrator) SplitGM(ev eventbus.Event) {
-	log.Printf("[event=%s] gm.split received (stub): %v", ev.EventID, ev.Payload)
-	// TODO: Implement splitting logic
+func (no *NarrativeOrchestrator) saveSnapshot(scopeID string, gm *GMInstance) error {
+	data, _ := json.Marshal(gm)
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(scopeID)))
+	timestamp := time.Now().Unix()
+	key := path.Join("gnue", "gm-snapshots", "v1", hash, fmt.Sprintf("%d_001.json", timestamp))
+	return no.minioClient.PutObject("gnue-snapshots", key, bytes.NewReader(data), int64(len(data)))
 }
 
-// HandleGameEvent processes world_events and game_events for active GMs.
 func (no *NarrativeOrchestrator) HandleGameEvent(ev eventbus.Event) {
-	if ev.ScopeID == nil {
+	eventPoint, ok := no.extractEventPoint(ev)
+	if !ok {
 		return
 	}
-	scopeID := *ev.ScopeID
 
-	// Блокируем на чтение
 	no.mu.RLock()
-	gm, exists := no.gms[scopeID]
-	if !exists {
-		no.mu.RUnlock()
-		return
+	gmsToNotify := []*GMInstance{}
+	for _, gm := range no.gms {
+		if gm.VisibilityScope.IsInScope(eventPoint) {
+			gmsToNotify = append(gmsToNotify, gm)
+		}
 	}
-	// Копируем необходимые данные для работы без блокировки
-	gmCopy := *gm
 	no.mu.RUnlock()
 
-	// Обновляем историю (требует записи)
-	no.mu.Lock()
-	currentGM, exists := no.gms[scopeID]
-	if exists {
-		currentGM.History = append(currentGM.History, HistoryEntry{
-			EventID:   ev.EventID,
-			Timestamp: ev.Timestamp,
-		})
+	for _, gm := range gmsToNotify {
+		no.processEventForGM(ev, gm)
 	}
+}
+
+func (no *NarrativeOrchestrator) processEventForGM(ev eventbus.Event, gm *GMInstance) {
+	no.mu.Lock()
+	gm.History = append(gm.History, HistoryEntry{
+		EventID:   ev.EventID,
+		Timestamp: ev.Timestamp,
+	})
 	no.mu.Unlock()
 
-	// Извлекаем entity IDs
 	entityIDs := extractEntityIDs(ev.Payload)
-	entityIDs = append(entityIDs, scopeID)
+	entityIDs = append(entityIDs, gm.ScopeID)
 
-	// Получаем контекст
-	contexts, err := no.semantic.GetContext(context.Background(), entityIDs)
-	if err != nil {
-		log.Printf("[event=%s] Failed to get context for GM %s: %v", ev.EventID, scopeID, err)
-		return
-	}
-
+	contexts, _ := no.semantic.GetContext(context.Background(), entityIDs)
 	worldContext := contexts[ev.WorldID]
 	if worldContext == "" {
 		worldContext = "Нет данных о мире"
@@ -244,58 +304,44 @@ func (no *NarrativeOrchestrator) HandleGameEvent(ev eventbus.Event) {
 		triggerEvent = "Событие с участием: " + strings.Join(toStringSlice(mentions), ", ")
 	}
 
-	// Генерация повествования с разделением system/user
-	systemPrompt, userPrompt := BuildPrompts(worldContext, scopeID, gmCopy.ScopeType, entitiesContext, triggerEvent)
+	systemPrompt, userPrompt := BuildPrompts(worldContext, gm.ScopeID, gm.ScopeType, entitiesContext, triggerEvent)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	oracleResp, err := CallOracle(ctx, systemPrompt, userPrompt)
-	if err != nil {
-		log.Printf("[event=%s] Oracle call failed for GM %s: %v", ev.EventID, scopeID, err)
-		return
-	}
-	// После успешного вызова Oracle
-	if err := no.saveSnapshot(scopeID, currentGM); err != nil {
-		log.Printf("Snapshot save failed for %s: %v", scopeID, err)
-	}
+	oracleResp, _ := CallOracle(ctx, systemPrompt, userPrompt)
 
-	// Сохраняем mood для continuity
 	if len(oracleResp.Mood) > 0 {
 		no.mu.Lock()
-		if gm, exists := no.gms[scopeID]; exists {
-			if gm.State == nil {
-				gm.State = make(map[string]interface{})
-			}
-			gm.State["last_mood"] = oracleResp.Mood
+		if gm.State == nil {
+			gm.State = make(map[string]interface{})
 		}
+		gm.State["last_mood"] = oracleResp.Mood
 		no.mu.Unlock()
 	}
 
-	// Публикация результата
 	outputEvent := eventbus.Event{
 		EventID:   "narrative-" + time.Now().Format("20060102-150405-") + ev.EventID[:8],
 		EventType: "narrative.generated",
 		Source:    "narrative-orchestrator",
 		WorldID:   ev.WorldID,
-		ScopeID:   &scopeID,
+		ScopeID:   &gm.ScopeID,
 		Payload: map[string]interface{}{
 			"narrative":  oracleResp.Narrative,
 			"mood":       oracleResp.Mood,
 			"new_events": oracleResp.NewEvents,
 			"trigger":    ev.EventID,
-			"gm_scope":   scopeID,
+			"gm_scope":   gm.ScopeID,
 		},
 		Timestamp: time.Now(),
 	}
 
 	no.bus.Publish(context.Background(), eventbus.TopicNarrativeOutput, outputEvent)
-	log.Printf("[event=%s] GM %s generated narrative", ev.EventID, scopeID)
+	no.saveSnapshot(gm.ScopeID, gm)
+	log.Printf("GM %s generated narrative", gm.ScopeID)
 }
 
-// Helper functions
 func extractEntityIDs(payload map[string]interface{}) []string {
 	var ids []string
-
 	if mentions, ok := payload["mentions"].([]interface{}); ok {
 		for _, m := range mentions {
 			if id, ok := m.(string); ok {
@@ -303,7 +349,6 @@ func extractEntityIDs(payload map[string]interface{}) []string {
 			}
 		}
 	}
-
 	if entityID, ok := payload["entity_id"].(string); ok {
 		ids = append(ids, entityID)
 	}
@@ -313,7 +358,6 @@ func extractEntityIDs(payload map[string]interface{}) []string {
 	if source, ok := payload["source"].(string); ok {
 		ids = append(ids, source)
 	}
-
 	return ids
 }
 
@@ -325,78 +369,4 @@ func toStringSlice(v []interface{}) []string {
 		}
 	}
 	return res
-}
-
-// saveSnapshot сохраняет состояние GM в MinIO.
-func (no *NarrativeOrchestrator) saveSnapshot(scopeID string, gm *GMInstance) error {
-	// Формируем snapshot как KnowledgeBase
-	snapshot := StateSnapshot{
-		Entities: map[string]interface{}{
-			scopeID: map[string]interface{}{
-				"scope_type":  gm.ScopeType,
-				"world_id":    gm.WorldID,
-				"history_len": len(gm.History),
-			},
-		},
-		Canon: []string{
-			// TODO: Загрузить из Semantic Memory или события
-		},
-	}
-	if lastMood, ok := gm.State["last_mood"]; ok {
-		if mood, ok := lastMood.([]string); ok {
-			snapshot.LastMood = mood
-		}
-	}
-
-	data, err := json.Marshal(snapshot)
-	if err != nil {
-		return fmt.Errorf("marshal snapshot: %w", err)
-	}
-
-	// Путь: gnue/gm-snapshots/v1/{sha256(scope_id)}/{timestamp}_001.json
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(scopeID)))
-	timestamp := time.Now().Unix()
-	path := fmt.Sprintf("gnue/gm-snapshots/v1/%s/%d_001.json", hash, timestamp)
-
-	return no.minioClient.PutObject("gnue-snapshots", path, bytes.NewReader(data), int64(len(data)))
-}
-
-// loadSnapshot загружает последний снапшот для scopeID.
-func (no *NarrativeOrchestrator) loadSnapshot(scopeID string) (*GMInstance, error) {
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(scopeID)))
-	prefix := fmt.Sprintf("gnue/gm-snapshots/v1/%s/", hash)
-
-	objects, err := no.minioClient.ListObjects("gnue-snapshots", prefix)
-	if err != nil {
-		return nil, err
-	}
-	if len(objects) == 0 {
-		return nil, fmt.Errorf("no snapshots found")
-	}
-
-	// Берём самый свежий
-	latest := objects[0]
-	data, err := no.minioClient.GetObject("gnue-snapshots", latest.Key)
-	if err != nil {
-		return nil, err
-	}
-
-	var snapshot StateSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return nil, err
-	}
-
-	// Восстанавливаем GM (минимально)
-	gm := &GMInstance{
-		ScopeID: scopeID,
-		// ScopeType, WorldID — можно извлечь из snapshot.Entities или оставить пустыми
-		State: map[string]interface{}{
-			"last_mood": snapshot.LastMood,
-		},
-		History:   []HistoryEntry{}, // Историю можно загрузить из event log отдельно
-		Config:    map[string]interface{}{},
-		CreatedAt: time.Now().Add(-1 * time.Minute), // Чтобы таймаут не сработал сразу
-	}
-
-	return gm, nil
 }

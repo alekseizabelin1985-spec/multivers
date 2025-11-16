@@ -1,0 +1,22 @@
+# Базовые настройки для всех GM
+time_window: "10m"
+context_depth:
+  canon: 3
+  history: 5
+  entities: 2
+include:
+  world_facts: false
+  entity_emotions: true
+  location_details: true
+  temporal_context: true
+triggers:
+  time_interval_ms: 10000
+  max_events: 50
+  narrative_triggers:
+    - "combat.start"
+    - "player.entered_boss_room"
+    - "ritual.completed"
+snapshot:
+  interval_events: 10
+  interval_ms: 30000
+  minio_path: "gnue/gm-snapshots/v1"

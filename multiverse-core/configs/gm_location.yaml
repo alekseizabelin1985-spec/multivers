@@ -1,0 +1,17 @@
+# GM для локации (location:*)
+scope_type: "location"
+focus_entities: []
+time_window: "10m"
+context_depth:
+  canon: 2
+  history: 3
+  entities: 1
+include:
+  world_facts: true
+  entity_emotions: true
+  location_details: true
+  temporal_context: true
+triggers:
+  narrative_triggers:
+    - "player.entered_location"
+    - "npc.hostile_event"
