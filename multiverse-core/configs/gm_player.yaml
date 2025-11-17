@@ -1,4 +1,3 @@
-# GM для игрока (player:*)
 scope_type: "player"
 focus_entities: ["{{.player_id}}"]
 time_window: "2m"
@@ -12,8 +11,12 @@ include:
   location_details: true
   temporal_context: true
 triggers:
-  time_interval_ms: 5000  # чаще — персональные реакции
+  time_interval_ms: 5000
   narrative_triggers:
     - "player.used_skill"
     - "player.died"
     - "player.got_item"
+
+# 👇 Новое: параметры видимости
+perception: 1.0  # Базовое восприятие (1.0 = 200 м)
+# Можно динамически менять через события: player.perception_changed

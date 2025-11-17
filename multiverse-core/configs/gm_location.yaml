@@ -1,4 +1,3 @@
-# GM для локации (location:*)
 scope_type: "location"
 focus_entities: []
 time_window: "10m"
@@ -15,3 +14,6 @@ triggers:
   narrative_triggers:
     - "player.entered_location"
     - "npc.hostile_event"
+
+# 👇 Новое: буфер вокруг локации
+geometry_buffer_m: 200  # +200 м вокруг границ города/помещения

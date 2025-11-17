@@ -106,7 +106,7 @@ func (s *Store) GetOverride(scopeID string) (*Profile, error) {
 
 // backgroundRefresh обновляет кэш каждые 30 сек (hot-reload).
 func (s *Store) backgroundRefresh() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(120 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {

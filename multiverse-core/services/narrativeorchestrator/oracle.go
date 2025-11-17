@@ -1,3 +1,5 @@
+// services/narrativeorchestrator/oracle.go
+
 package narrativeorchestrator
 
 import (
@@ -8,20 +10,17 @@ import (
 	"strings"
 )
 
-// OracleResponse represents the JSON output from Qwen3.
 type OracleResponse struct {
 	Narrative string                   `json:"narrative"`
-	Mood      []string                 `json:"mood,omitempty"` // Атмосфера от LLM
+	Mood      []string                 `json:"mood,omitempty"`
 	NewEvents []map[string]interface{} `json:"new_events"`
 }
 
-// CallOracle sends a prompt to Ascension Oracle and returns the response.
 func CallOracle(ctx context.Context, systemPrompt, userPrompt string) (*OracleResponse, error) {
 	client := oracle.NewClient()
-
 	content, err := client.CallStructured(ctx, systemPrompt, userPrompt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to oracle: %w", err)
+		return nil, fmt.Errorf("oracle call failed: %w", err)
 	}
 	if content == "" {
 		return nil, fmt.Errorf("oracle returned empty content")
@@ -29,19 +28,16 @@ func CallOracle(ctx context.Context, systemPrompt, userPrompt string) (*OracleRe
 
 	var result OracleResponse
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		return nil, fmt.Errorf("oracle returned invalid JSON: %s", content)
+		return nil, fmt.Errorf("invalid JSON: %s", content)
 	}
-
 	if result.Narrative == "" {
-		return nil, fmt.Errorf("oracle returned empty narrative")
+		return nil, fmt.Errorf("empty narrative")
 	}
-
 	return &result, nil
 }
 
-// BuildPrompts returns system and user parts separately.
-func BuildPrompts(worldContext, scopeID, scopeType string, entitiesContext, triggerEvent string) (systemPrompt, userPrompt string) {
-	systemPrompt = strings.TrimSpace(`
+func BuildPrompts(worldContext, scopeID, scopeType string, entitiesContext, triggerEvent string) (string, string) {
+	system := strings.TrimSpace(`
 Ты — Повествователь Мира. Твоя задача — развивать историю естественно, иммерсивно и поэтично.
 
 ### КОНТЕКСТ МИРА
@@ -53,30 +49,61 @@ ID области: ` + scopeID + `
 Сущности в области:
 ` + entitiesContext)
 
-	userPrompt = strings.TrimSpace(`
+	user := strings.TrimSpace(`
 ### СОБЫТИЕ-ТРИГГЕР
 ` + triggerEvent + `
 
 ### ЗАДАЧА
 Подумай: что *логично* происходит дальше?
 — Учитывай факты, характеры, обстановку.
-— Если уместно, используй стилевые модификаторы: 
-  «внезапно», «трагично», «иронично», «поэтично», «мрачно» и т.д.
-— Ты волен определить тон и атмосферу самостоятельно.
+— Даже если событий мало — мир живёт: ветер, тени, эмоции.
+— Используй стилевые модификаторы: «внезапно», «плавно», «тревожно».
+
+### СОЗДАНИЕ И ОБНОВЛЕНИЕ СУЩНОСТЕЙ
+Генерируй события ТОЛЬКО в формате EntityManager:
+
+1. Для новых сущностей:
+   { "event_type": "entity.created", "entity_id": "...", "entity_type": "...", "payload": { ... } }
+
+2. Для обновления:
+   {
+     "event_type": "world_events",
+     "payload": {
+       "state_changes": [
+         { "entity_id": "...", "operations": [ { "op": "set", "path": "...", "value": ... } ] }
+       ]
+     }
+   }
 
 ### ТРЕБОВАНИЯ
 1. Ответ строго в формате JSON.
-2. "narrative": 1–3 предложения, для игроков.
+2. "narrative": 1–3 предложения.
 3. "mood": массив строк (опционально).
 4. "new_events": массив (макс. 3) событий.
 
 ### ФОРМАТ ОТВЕТА
 {
-  "narrative": "строка",
-  "mood": ["тег1", "тег2"],
+  "narrative": "Тень сгустилась — и из неё выскочил пёс!",
+  "mood": ["sudden", "threatening"],
   "new_events": [
-    { "event_type": "строка", "source": "ID", "target": "ID?", "payload": { ... } }
+    {
+      "event_type": "entity.created",
+      "entity_id": "npc:shadow_hound-777",
+      "entity_type": "npc",
+      "payload": { "name": "Теневой пёс", "hp": 45 }
+    },
+    {
+      "event_type": "world_events",
+      "payload": {
+        "state_changes": [{
+          "entity_id": "player:kain-777",
+          "operations": [
+            { "op": "set", "path": "perception", "value": 1.5 }
+          ]
+        }]
+      }
+    }
   ]
 }`)
-	return systemPrompt, userPrompt
+	return system, user
 }

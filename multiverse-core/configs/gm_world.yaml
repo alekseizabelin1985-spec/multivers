@@ -1,4 +1,3 @@
-# GM для мира (world:*)
 scope_type: "world"
 focus_entities: []
 time_window: "24h"
@@ -12,8 +11,10 @@ include:
   location_details: true
   temporal_context: true
 triggers:
-  time_interval_ms: 30000  # реже — глобальные события
-  max_events: 100
+  time_interval_ms: 30000
   narrative_triggers:
     - "world.cataclysm_started"
     - "season.changed"
+
+# 👇 Для мира буфер не нужен — радиус бесконечный
+# geometry_buffer_m: 0  # не требуется
