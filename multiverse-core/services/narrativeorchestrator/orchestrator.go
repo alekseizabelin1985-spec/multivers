@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,28 +33,41 @@ type GetContextResponse struct {
 	Contexts map[string]string `json:"contexts"`
 }
 
-type StateSnapshot struct {
-	Entities map[string]interface{} `json:"entities"`
-	Canon    []string               `json:"canon"`
-	LastMood []string               `json:"last_mood,omitempty"`
+// ContextWithEventsRequest для /v1/context-with-events.
+type ContextWithEventsRequest struct {
+	EntityIDs  []string `json:"entity_ids"`
+	EventTypes []string `json:"event_types,omitempty"`
+	Depth      int      `json:"depth,omitempty"`
 }
 
-func (c *SemanticMemoryClient) GetContext(ctx context.Context, entityIDs []string) (map[string]string, error) {
-	if len(entityIDs) == 0 {
-		return map[string]string{}, nil
-	}
-	reqBody, _ := json.Marshal(map[string]interface{}{
-		"entity_ids": entityIDs,
-		"depth":      2,
+type ContextWithEventsResponse struct {
+	Contexts map[string]interface{} `json:"contexts"`
+}
+
+func (c *SemanticMemoryClient) GetContextWithEvents(ctx context.Context, entityIDs []string, eventTypes []string, depth int) (map[string]interface{}, error) {
+	reqBody, _ := json.Marshal(ContextWithEventsRequest{
+		EntityIDs:  entityIDs,
+		EventTypes: eventTypes,
+		Depth:      depth,
 	})
-	resp, err := http.Post(c.BaseURL+"/v1/context", "application/json", bytes.NewBuffer(reqBody))
+
+	resp, err := http.Post(c.BaseURL+"/v1/context-with-events", "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var result GetContextResponse
-	json.NewDecoder(resp.Body).Decode(&result)
+
+	var result ContextWithEventsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
 	return result.Contexts, nil
+}
+
+type StateSnapshot struct {
+	Entities map[string]interface{} `json:"entities"`
+	Canon    []string               `json:"canon"`
+	LastMood []string               `json:"last_mood,omitempty"`
 }
 
 type NarrativeOrchestrator struct {
@@ -422,6 +436,7 @@ func (no *NarrativeOrchestrator) processBatchForGM(gm *GMInstance) {
 	no.processEventForGM(dummyEvent, gm)
 }
 
+// processEventForGM — основной метод обработки.
 func (no *NarrativeOrchestrator) processEventForGM(ev eventbus.Event, gm *GMInstance) {
 	if ev.EventType != "batch.process" && ev.EventType != "time.syncTime" {
 		no.mu.Lock()
@@ -432,18 +447,41 @@ func (no *NarrativeOrchestrator) processEventForGM(ev eventbus.Event, gm *GMInst
 		no.mu.Unlock()
 	}
 
-	entityIDs := extractEntityIDs(ev.Payload)
-	entityIDs = append(entityIDs, gm.ScopeID)
+	// Определяем события для обработки
+	var eventsToProcess []HistoryEntry
+	if ev.EventType == "batch.process" || ev.EventType == "time.syncTime" {
+		no.mu.RLock()
+		eventsToProcess = make([]HistoryEntry, len(gm.History))
+		copy(eventsToProcess, gm.History)
+		no.mu.RUnlock()
+	} else {
+		eventsToProcess = []HistoryEntry{{
+			EventID:   ev.EventID,
+			Timestamp: ev.Timestamp,
+		}}
+	}
 
-	contexts, _ := no.semantic.GetContext(context.Background(), entityIDs)
-	worldContext := contexts[ev.WorldID]
+	// Получаем контекст с событиями из Semantic Memory
+	entityIDs := append([]string{}, gm.FocusEntities...)
+	eventTypes := []string{} // или ["player.*", "combat.*"] из конфига
+	contexts, err := no.semantic.GetContextWithEvents(context.Background(), entityIDs, eventTypes, 2)
+	if err != nil {
+		log.Printf("Failed to get context with events: %v", err)
+		return
+	}
+
+	// Извлекаем данные
+	worldContext := ""
+	if wc, ok := contexts[gm.WorldID].(map[string]interface{})["context"].(string); ok {
+		worldContext = wc
+	}
 	if worldContext == "" {
 		worldContext = "Нет данных о мире"
 	}
 
 	var entitiesLines []string
-	for _, id := range entityIDs {
-		if ctx, exists := contexts[id]; exists {
+	for _, id := range gm.FocusEntities {
+		if ctx, ok := contexts[id].(map[string]interface{})["context"].(string); ok {
 			entitiesLines = append(entitiesLines, ctx)
 		}
 	}
@@ -452,21 +490,45 @@ func (no *NarrativeOrchestrator) processEventForGM(ev eventbus.Event, gm *GMInst
 		entitiesContext = strings.Join(entitiesLines, "\n")
 	}
 
+	// Кластеризация событий
+	clusters := clusterEvents(eventsToProcess)
+
+	// Временной контекст
+	var lastEventTime *time.Time
+	if len(gm.History) > 0 {
+		t := gm.History[len(gm.History)-1].Timestamp
+		lastEventTime = &t
+	}
+	lastMood := []string{}
+	if mood, ok := gm.State["last_mood"].([]string); ok {
+		lastMood = mood
+	}
+	timeContext := BuildTimeContext(lastEventTime, lastMood)
+
+	// Триггер
 	triggerEvent := "Прошло время. Мир продолжает жить."
-	if ev.EventType != "batch.process" && ev.EventType != "time.syncTime" {
-		if desc, exists := ev.Payload["description"].(string); exists {
-			triggerEvent = desc
-		} else if mentions, exists := ev.Payload["mentions"].([]interface{}); exists {
-			triggerEvent = "Событие с участием: " + strings.Join(toStringSlice(mentions), ", ")
-		}
+	if len(eventsToProcess) > 0 {
+		triggerEvent = "Накопленные события за период"
 	}
 
-	systemPrompt, userPrompt := BuildPrompts(worldContext, gm.ScopeID, gm.ScopeType, entitiesContext, triggerEvent)
+	// Формируем промт
+	input := PromptInput{
+		WorldContext:    worldContext,
+		ScopeID:         gm.ScopeID,
+		ScopeType:       gm.ScopeType,
+		EntitiesContext: entitiesContext,
+		EventClusters:   clusters,
+		TimeContext:     timeContext,
+		TriggerEvent:    triggerEvent,
+	}
+	systemPrompt, userPrompt := BuildPrompt(input)
 
+	// Вызов Oracle
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	oracleResp, _ := CallOracle(ctx, systemPrompt, userPrompt)
 
+	// Публикация
 	if len(oracleResp.Mood) > 0 {
 		no.mu.Lock()
 		if gm.State == nil {
@@ -495,6 +557,51 @@ func (no *NarrativeOrchestrator) processEventForGM(ev eventbus.Event, gm *GMInst
 
 	no.saveSnapshot(gm.ScopeID, gm)
 	log.Printf("GM %s generated narrative", gm.ScopeID)
+}
+
+// clusterEvents — группировка по времени.
+func clusterEvents(events []HistoryEntry) []EventCluster {
+	if len(events) == 0 {
+		return nil
+	}
+
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].Timestamp.Before(events[j].Timestamp)
+	})
+
+	var clusters []EventCluster
+	currentEvents := []string{}
+
+	addCluster := func(first, last time.Time, events []string) {
+		duration := last.Sub(first).Milliseconds()
+		clusters = append(clusters, EventCluster{
+			RelativeTime: humanizeDuration(duration),
+			Description:  strings.Join(events, "; "),
+		})
+	}
+
+	if len(events) == 0 {
+		return clusters
+	}
+
+	first := events[0].Timestamp
+	currentEvents = append(currentEvents, fmt.Sprintf("Событие: %s", events[0].EventID))
+
+	for i := 1; i < len(events); i++ {
+		prev := events[i-1].Timestamp
+		curr := events[i].Timestamp
+		gap := curr.Sub(prev).Milliseconds()
+
+		if gap > 50 {
+			addCluster(first, prev, currentEvents)
+			first = curr
+			currentEvents = []string{}
+		}
+		currentEvents = append(currentEvents, fmt.Sprintf("Событие: %s", events[i].EventID))
+	}
+
+	addCluster(first, events[len(events)-1].Timestamp, currentEvents)
+	return clusters
 }
 
 func (no *NarrativeOrchestrator) extractEventPoint(ev eventbus.Event) (spatial.Point, bool) {

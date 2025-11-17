@@ -23,8 +23,14 @@ type GMInstance struct {
 	State           map[string]interface{}  `json:"state"`
 	History         []HistoryEntry          `json:"history"`
 	Config          map[string]interface{}  `json:"config"`
-	LastProcessTime int64                   `json:"last_process_time"` // Unix ms из time.syncTime
+	LastProcessTime int64                   `json:"last_process_time"`
 	CreatedAt       time.Time               `json:"created_at"`
+}
+
+// EventCluster для временной группировки.
+type EventCluster struct {
+	RelativeTime string
+	Description  string
 }
 
 func (gm *GMInstance) UpdateVisibilityScope(provider spatial.GeometryProvider) {
