@@ -100,6 +100,7 @@ func NewService(bus *eventbus.EventBus) (*Service, error) {
 			return
 		}
 
+		log.Println(req)
 		// Retrieve context with events from storage
 		contexts, err := indexer.GetContextWithEvents(r.Context(), req.EntityIDs, req.EventTypes, req.Depth)
 		if err != nil {

@@ -203,9 +203,10 @@ func (c *ChromaClient) GetDocuments(ctx context.Context, entityIDs []string) (ma
 		"ids": entityIDs,
 		// "where": nil, // Дополнительные фильтры
 		// "where_document": nil, // Фильтры по документу
-		// "include": ["documents", "metadatas", "embeddings"] // Что включать в ответ
+		"include": []string{"documents", "metadatas", "embeddings"}, // Что включать в ответ
 		// Для простоты, ChromaDB обычно возвращает все по умолчанию или документы, если не указано иное
 	}
+	log.Println(payload)
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
@@ -271,7 +272,7 @@ func (c *ChromaClient) SearchEventsByType(ctx context.Context, eventType string,
 	}
 
 	payload := map[string]interface{}{
-		"where": whereClause,
+		"where":     whereClause,
 		"n_results": limit,
 	}
 
